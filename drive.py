@@ -15,12 +15,17 @@ from io import BytesIO
 from keras.models import load_model
 import h5py
 from keras import __version__ as keras_version
+import cv2
+from math import exp
 
 sio = socketio.Server()
 app = Flask(__name__)
 model = None
 prev_image_array = None
 
+steering_window = 3
+angles = np.zeros(steering_window)
+frame_count = [0]
 
 class SimplePIController:
     def __init__(self, Kp, Ki):
@@ -44,9 +49,21 @@ class SimplePIController:
 
 
 controller = SimplePIController(0.1, 0.002)
-set_speed = 9
+set_speed = 30
 controller.set_desired(set_speed)
 
+def auto_canny(image, sigma=0.33):
+    # compute the median of the single channel pixel intensities
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image = cv2.GaussianBlur(image, (3, 3), 0)
+    v = np.median(image)
+    # apply automatic Canny edge detection using the computed median
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    edged = cv2.Canny(image, lower, upper)
+
+    # return the edged image
+    return edged
 
 @sio.on('telemetry')
 def telemetry(sid, data):
@@ -61,11 +78,25 @@ def telemetry(sid, data):
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
+
+        image_array = image_array[70:135, 0:320]
+        image_array = auto_canny(image_array)
+        image_array = cv2.resize(image_array,(64,64))
+        image_array = image_array[:,:,np.newaxis]
+
         steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
+        angles[frame_count[0] % steering_window] = steering_angle
+        steering_angle = np.mean(angles)
+        #throttle = controller.update(float(speed))
+        if abs(float(steering_angle)*float(speed)) ==0:
+            throttle = 0.3
+        else:
+            throttle = 0.3*0.5/abs(float(steering_angle)*float(speed))
 
-        throttle = controller.update(float(speed))
+        print("steering: {} throttle: {} speed: {}".format(float(steering_angle), float(steering_angle), float(speed)))
+        # throttle = (0.3 / exp(0.1 * abs(float(steering_angle)))) - abs(float(steering_angle)) * exp(0.03 * float(speed)) * 0.1
 
-        print(steering_angle, throttle)
+
         send_control(steering_angle, throttle)
 
         # save frame
@@ -73,6 +104,8 @@ def telemetry(sid, data):
             timestamp = datetime.utcnow().strftime('%Y_%m_%d_%H_%M_%S_%f')[:-3]
             image_filename = os.path.join(args.image_folder, timestamp)
             image.save('{}.jpg'.format(image_filename))
+
+        frame_count[0] += 1
     else:
         # NOTE: DON'T EDIT THIS.
         sio.emit('manual', data={}, skip_sid=True)
